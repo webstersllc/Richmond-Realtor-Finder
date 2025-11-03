@@ -3,42 +3,45 @@ import requests
 import re
 import json
 import time
-from bs4 import BeautifulSoup
 from flask import Flask, render_template_string, jsonify
 
-# === ENVIRONMENT ===
+# === ENVIRONMENT VARIABLES ===
 BREVO_API_KEY = os.getenv("BREVO_API_KEY")
-BREVO_LIST_ID = 4  # Your secure Brevo List ID
+BREVO_LIST_ID = 4  # your fixed Brevo list ID
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")  # Google Places API key
 PORT = int(os.getenv("PORT", 10000))
 
 if not BREVO_API_KEY:
-    raise ValueError("Missing BREVO_API_KEY environment variable. Please set it in Render.")
+    raise ValueError("Missing BREVO_API_KEY environment variable. Please set it.")
+if not GOOGLE_API_KEY:
+    raise ValueError("Missing GOOGLE_API_KEY environment variable. Please set it.")
 
-# === SEARCH TERMS (Target Local Broker & Realtor Pages) ===
-SEARCH_TERMS = [
-    "real estate agency Richmond VA contact",
-    "real estate office Henrico VA contact",
-    "realtors near Richmond VA site:kw.com OR site:longandfoster.com OR site:remax.com",
-    "real estate broker Chesterfield VA contact",
-    "real estate team Ashland VA contact",
-    "realty company Goochland VA contact",
+# === SEARCH SETTINGS ===
+# We'll query Google Places API for new real estate related businesses
+SEARCH_QUERIES = [
+    "real estate agency in Richmond VA",
+    "realtor office Richmond Virginia",
+    "real estate broker Henrico VA",
+    "property management company Richmond VA",
+    "real estate firm Chesterfield VA",
+    "realty company Goochland VA"
 ]
 
-HEADERS = {"User-Agent": "Mozilla/5.0"}
 EMAIL_PATTERN = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 PHONE_PATTERN = re.compile(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}")
 
-# === APP STATE ===
+# === APP SETUP ===
 app = Flask(__name__)
-uploaded_emails, log_lines = set(), []
-uploaded_count, current_status = 0, "Idle"
+uploaded_emails = set()
+uploaded_count = 0
+log_lines = []
+current_status = "Idle"
 
 def log(msg):
-    """Print and store a log line."""
     global log_lines
     print(msg)
     log_lines.append(msg)
-    if len(log_lines) > 250:
+    if len(log_lines) > 200:
         log_lines.pop(0)
 
 def set_status(s):
@@ -46,134 +49,144 @@ def set_status(s):
     current_status = s
     log(f"📍 {s}")
 
-# === SEARCH & SCRAPE ===
-def duckduckgo_search(term):
-    set_status(f"Searching: {term}")
+# === GOOGLE PLACES API FUNCTIONS ===
+def query_google_places(text_query):
+    """Use Google Places Text Search API to get business results."""
+    set_status(f"Querying: {text_query}")
+    url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
+    params = {
+        "query": text_query,
+        "key": GOOGLE_API_KEY,
+        "region": "us"
+    }
     try:
-        q = term.replace(" ", "+")
-        url = f"https://html.duckduckgo.com/html/?q={q}"
-        r = requests.get(url, headers=HEADERS, timeout=10)
-        soup = BeautifulSoup(r.text, "html.parser")
+        resp = requests.get(url, params=params, timeout=10)
+        data = resp.json()
+        results = data.get("results", [])
         links = []
-        for a in soup.find_all("a", href=True):
-            h = a["href"]
-            if "http" in h and "duckduckgo" not in h:
-                links.append(h)
-        return list(set(links))[:25]
+        for r in results:
+            if "website" in r:
+                links.append(r["website"])
+            elif "place_id" in r:
+                # fallback: construct link to place_id
+                links.append(f"https://www.google.com/maps/place/?q=place_id:{r['place_id']}")
+        return links[:20]
     except Exception as e:
-        log(f"⚠️ Search failed: {e}")
+        log(f"⚠️ Google Places query failed: {e}")
         return []
 
 def scrape_page(url):
-    """Scrape the given page for emails, phones, and names."""
+    """Scrape business page for contact info."""
     try:
         set_status(f"Scanning: {url}")
-        r = requests.get(url, headers=HEADERS, timeout=10)
-        soup = BeautifulSoup(r.text, "html.parser")
-        text = soup.get_text(" ", strip=True)
-
-        emails = list(set(re.findall(EMAIL_PATTERN, text)))
-        phones = list(set(re.findall(PHONE_PATTERN, text)))
-
-        name = ""
-        for tag in soup.find_all(["h1", "h2", "strong", "p"]):
-            if any(k in tag.text.lower() for k in ["realtor", "agent", "team", "broker", "staff", "about"]):
-                name = tag.text.strip()[:60]
-                break
-
-        company = soup.title.string.strip() if soup.title else "Unknown Realtor"
-        return {"name": name, "email": emails, "phone": phones, "company": company, "url": url}
+        resp = requests.get(url, timeout=10)
+        text = resp.text
+        emails = list(set(EMAIL_PATTERN.findall(text)))
+        phones = list(set(PHONE_PATTERN.findall(text)))
+        # simple business name retrieval
+        name = url.split("//")[-1].split("/")[0]
+        return {
+            "name": name,
+            "email": emails,
+            "phone": phones,
+            "website": url
+        }
     except Exception as e:
-        log(f"⚠️ Error scraping {url}: {e}")
+        log(f"⚠️ Scrape fail {url}: {e}")
         return None
 
-def add_to_brevo(c):
-    """Upload a valid contact to Brevo."""
+def add_to_brevo(contact):
+    """Upload contact to Brevo if valid and unique."""
     global uploaded_count
-    if not c["email"]:
+    if not contact["email"]:
         return
-    e = c["email"][0]
-    if e in uploaded_emails:
+    email = contact["email"][0]
+    if email in uploaded_emails:
         return
-
-    uploaded_emails.add(e)
-    headers = {"accept": "application/json", "content-type": "application/json", "api-key": BREVO_API_KEY}
-    data = {
-        "email": e,
-        "attributes": {
-            "FIRSTNAME": c.get("name", ""),
-            "COMPANY": c.get("company", ""),
-            "PHONE": c["phone"][0] if c["phone"] else "",
-            "WEBSITE": c["url"],
-        },
-        "listIds": [BREVO_LIST_ID],
+    uploaded_emails.add(email)
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "api-key": BREVO_API_KEY
     }
-
+    data = {
+        "email": email,
+        "attributes": {
+            "FIRSTNAME": contact.get("name", ""),
+            "COMPANY": contact.get("name", ""),
+            "PHONE": contact["phone"][0] if contact["phone"] else "",
+            "WEBSITE": contact["website"]
+        },
+        "listIds": [BREVO_LIST_ID]
+    }
     try:
         r = requests.post("https://api.brevo.com/v3/contacts", headers=headers, data=json.dumps(data))
         if r.status_code in [200, 201]:
             uploaded_count += 1
-            log(f"✅ Uploaded: {e} ({uploaded_count} total)")
+            log(f"✅ Uploaded: {email} ({uploaded_count} total)")
         else:
-            log(f"⚠️ Brevo {r.status_code}: {r.text}")
+            log(f"⚠️ Brevo response: {r.status_code} - {r.text}")
     except Exception as e:
-        log(f"❌ Upload failed: {e}")
+        log(f"❌ Brevo upload failed: {e}")
 
 def run_scraper():
-    """Run the full scraping loop."""
+    """Main scraper loop."""
     global uploaded_count
     uploaded_count = 0
     log("🚀 Scraper started.")
-    for term in SEARCH_TERMS:
-        links = duckduckgo_search(term)
-        for link in links:
-            info = scrape_page(link)
+    for query in SEARCH_QUERIES:
+        websites = query_google_places(query)
+        for site in websites:
+            info = scrape_page(site)
             if info and info["email"]:
                 add_to_brevo(info)
             time.sleep(1)
-    set_status("✅ Completed all search terms.")
+    set_status("✅ Completed all queries.")
     log("🎯 Run finished.")
 
-# === HTML FRONTEND ===
+# === WEB UI ===
 HTML = """
-<!DOCTYPE html><html><head><title>Richmond Realtor Finder</title>
+<!DOCTYPE html>
+<html>
+<head><title>Richmond Realtor Lead Finder</title>
 <style>
-body{background:#0d0d0d;color:#f44336;font-family:Arial;text-align:center;margin:0}
-h1{color:#ff5555}
+body{background:#0d0d0d;color:#f44336;font-family:Arial;text-align:center;margin:0;padding:20px}
 button{background:#f44336;color:white;border:none;padding:14px 28px;font-size:18px;border-radius:8px;cursor:pointer;margin:20px}
 button:hover{background:#ff6659}
-#status{font-size:18px;margin-top:10px}
-#counter{font-size:20px;margin:10px}
-#log{width:85%;height:400px;margin:20px auto;background:#111;color:#ff5555;padding:15px;border-radius:8px;overflow-y:scroll;text-align:left;font-size:14px}
+.status{font-size:18px;margin-top:10px}
+.counter{font-size:20px;margin:10px}
+.log{width:85%;height:400px;margin:20px auto;background:#111;color:#ff5555;padding:15px;border-radius:8px;overflow-y:scroll;text-align:left;font-size:14px}
 </style>
 <script>
 async function startScraper(){
-  document.getElementById('status').innerText='🚀 Starting scraper...';
+  document.getElementById('status').innerText='🚀 Starting...';
   await fetch('/run');
-  update();
+  updateLog();
 }
-async function update(){
-  const r=await fetch('/logs');
-  const d=await r.json();
-  document.getElementById('log').innerText=d.logs.join('\\n');
+async function updateLog(){
+  const r = await fetch('/logs');
+  const d = await r.json();
+  document.getElementById('log').innerText = d.logs.join('\\n');
   document.getElementById('counter').innerText='Uploaded Leads: '+d.count;
   document.getElementById('status').innerText=d.status;
   document.getElementById('log').scrollTop=document.getElementById('log').scrollHeight;
-  setTimeout(update,3000);
+  setTimeout(updateLog,3000);
 }
-</script></head>
-<body onload="update()">
-<h1>Richmond Realtor Finder</h1>
+</script>
+</head>
+<body onload="updateLog()">
+<h1>Richmond Realtor Lead Finder</h1>
 <button onclick="startScraper()">Start Scraper</button>
-<div id="status">{{status}}</div>
-<div id="counter">Uploaded Leads: {{count}}</div>
-<div id="log"></div>
-</body></html>
+<div class="status">{{status}}</div>
+<div class="counter">Uploaded Leads: {{count}}</div>
+<div class="log" id="log"></div>
+</body>
+</html>
 """
 
 @app.route("/")
 def home():
-    return render_template_string(HTML,status=current_status,count=uploaded_count)
+    return render_template_string(HTML, status=current_status, count=uploaded_count)
 
 @app.route("/run")
 def run_now():
@@ -182,8 +195,8 @@ def run_now():
     return jsonify({"status":"running"})
 
 @app.route("/logs")
-def logs():
+def get_logs():
     return jsonify({"logs":log_lines,"status":current_status,"count":uploaded_count})
 
-if __name__=="__main__":
-    app.run(host="0.0.0.0",port=PORT)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=PORT)
